@@ -22,7 +22,7 @@ lazy_static::lazy_static! {
     // Linux `ss -ltnp` (or `netstat -ltnp`): Looking for port and PID
     // Example: tcp   LISTEN  0   128    *:80   *:*   users:(("nginx",pid=123,fd=4))
     // Simplified: just get IP:Port and PID part
-    static ref LINUX_SS_REGEX: Regex = Regex::new(r"(?m)^\s*tcp\s+LISTEN\s+\d+\s+\d+\s+[^:]+:(\d+)\s+.*\s+pid=(\d+),").unwrap();
+    static ref LINUX_SS_REGEX: Regex = Regex::new(r"(?m)^\s*tcp\s+LISTEN\s+\d+\s+\d+\s+(?:\*|\[::\]):(\d+)\s+.*?users:.*?pid=(\d+)").unwrap();
 
     // macOS `netstat -anv -p tcp` (lsof is better but netstat is also an option)
     // `lsof -iTCP -sTCP:LISTEN -P -n -F pcnP` is complex to parse sequentially.
