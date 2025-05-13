@@ -30,11 +30,11 @@ cargo build --release
 
 3. The binary will be available at `target/release/port-watcher`
 
-### Using Cargo
+<!-- ### Using Cargo
 
 ```bash
 cargo install port-watcher
-```
+``` -->
 
 ## Usage
 
