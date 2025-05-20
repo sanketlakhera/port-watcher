@@ -1,13 +1,13 @@
-mod errors;
-
 use clap::Parser;
-use errors::PortWatcherError;
+// errors::PortWatcherError is now part of the library crate `port_watcher`
+// use errors::PortWatcherError;
+use port_watcher::{parse_ports_spec, PortWatcherError}; // Use from library
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::str;
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, System, ProcessRefreshKind, ProcessesToUpdate};
 
 lazy_static::lazy_static! {
     // Regex for parsing netstat/ss output is tricky and platform-dependent.
@@ -35,7 +35,13 @@ lazy_static::lazy_static! {
     // COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
     // ControlCe   332 myuser  22u  IPv4 0xabcdef1234567890      0t0  TCP *:5000 (LISTEN)
     // SystemUIS   333 myuser  17u  IPv6 0xabcdef1234567890      0t0  TCP [::1]:12345 (LISTEN)
-    static ref MACOS_LSOF_REGEX: Regex = Regex::new(r"^(?P<command>\S+)\s+(?P<pid>\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(?:\[::1\]|(?:(?:\*|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\.(?P<port_name_or_num>\S+))|(?:\*|\[::\]):(?P<port_num>\d+))\s*\(LISTEN\)").unwrap();
+    // rapportd    759 myuser  11u  IPv4 0xabcdef1234567890      0t0  TCP 127.0.0.1:60140 (LISTEN)
+    // The regex aims to capture PID (2nd column) and port (from 9th column, NAME).
+    // It assumes `lsof -P -n` output which provides numeric ports.
+    // Handles NAME formats like *:PORT, IPV4:PORT, [IPV6]:PORT, [IPV6%scope]:PORT
+    static ref MACOS_LSOF_REGEX: Regex = Regex::new(
+        r"^(?P<command>\S+)\s+(?P<pid>\d+)(?:\s+\S+){6}\s+(?:(?:[^\s:]+)|(?:\[[^\s\]]+\])):(?P<port>\d+)\s+\(LISTEN\)"
+    ).unwrap();
 
     // Windows `netstat -ano -p TCP`
     // Example:  TCP    0.0.0.0:80           0.0.0.0:0              LISTENING       1234
@@ -111,7 +117,7 @@ fn main() -> Result<(), PortWatcherError> {
                             pid,
                             port
                         );
-                        match kill_process_by_pid(pid, &s) {
+                        match kill_process_by_pid(pid, &mut s) { // Pass s as mutable
                             Ok(()) => println!("Successfully killed process PID {}.", pid),
                             Err(e) => eprintln!("Failed to kill process PID {}: {}", pid, e),
                         }
@@ -164,61 +170,7 @@ fn main() -> Result<(), PortWatcherError> {
     Ok(())
 }
 
-fn parse_ports_spec(ports_str: &str) -> Result<HashSet<u16>, PortWatcherError> {
-    let mut ports = HashSet::new();
-    for part in ports_str.split(',') {
-        let trimmed_part = part.trim();
-        if trimmed_part.contains('-') {
-            let range_parts: Vec<&str> = trimmed_part.split('-').collect();
-            if range_parts.len() == 2 {
-                let start = range_parts[0].parse::<u16>().map_err(|_| {
-                    PortWatcherError::InvalidPort(format!(
-                        "Invalid range start: {}",
-                        range_parts[0]
-                    ))
-                })?;
-                let end = range_parts[1].parse::<u16>().map_err(|_| {
-                    PortWatcherError::InvalidPort(format!("Invalid range end: {}", range_parts[1]))
-                })?;
-                if start > end {
-                    return Err(PortWatcherError::InvalidPort(format!(
-                        "Invalid range: start ({}) > end ({})",
-                        start, end
-                    )));
-                }
-                if start == 0 || end == 0 {
-                    return Err(PortWatcherError::InvalidPort(
-                        "Port number cannot be 0".to_string(),
-                    ));
-                }
-                for port in start..=end {
-                    ports.insert(port);
-                }
-            } else {
-                return Err(PortWatcherError::InvalidPort(format!(
-                    "Invalid range format: {}",
-                    trimmed_part
-                )));
-            }
-        } else {
-            let port = trimmed_part.parse::<u16>().map_err(|_| {
-                PortWatcherError::InvalidPort(format!("Invalid port number: {}", trimmed_part))
-            })?;
-            if port == 0 {
-                return Err(PortWatcherError::InvalidPort(
-                    "Port number cannot be 0".to_string(),
-                ));
-            }
-            ports.insert(port);
-        }
-    }
-    if ports.is_empty() {
-        return Err(PortWatcherError::InvalidPort(
-            "No ports specified".to_string(),
-        ));
-    }
-    Ok(ports)
-}
+// parse_ports_spec function has been moved to src/lib.rs
 
 fn get_all_listening_tcp_ports(s: &System) -> Result<HashMap<u16, PortInfo>, PortWatcherError> {
     let mut listening_ports = HashMap::new();
@@ -226,28 +178,46 @@ fn get_all_listening_tcp_ports(s: &System) -> Result<HashMap<u16, PortInfo>, Por
     #[cfg(target_os = "linux")]
     {
         // Try `ss` first, fallback to `netstat` if ss is not available or fails
-        let output = Command::new("ss")
+        let output_result = Command::new("ss")
             .args(["-ltnp"]) // TCP, listening, numeric, processes
             .output();
 
-        let output = match output {
-            Ok(out) if out.status.success() => out,
-            _ => {
-                // Fallback to netstat
+        let final_output = match output_result {
+            Ok(out) if out.status.success() => Ok(out),
+            Err(_e) => { // ss command failed to execute (e.g. not found or other IO error)
+                // Try netstat
                 Command::new("netstat")
-                    .args(["-ltnp"]) // TCP, listening, numeric, processes
-                    .output()?
+                    .args(["-ltnp"])
+                    .output()
+                    // .map_err(PortWatcherError::Io) // Map IO error from netstat
             }
-        };
+            Ok(out) => { // ss executed but failed (e.g. returned non-zero exit code)
+                 // Try netstat, and if this also fails, map its error
+                Command::new("netstat")
+                    .args(["-ltnp"])
+                    .output()
+                    // .map_err(PortWatcherError::Io) // Map IO error from netstat
+            }
+        }?; // Propagate IO error if command itself fails to run (e.g. from the fallback)
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !final_output.status.success() {
+            let stderr = String::from_utf8_lossy(&final_output.stderr);
+            // This logic tries to guess which command's error to report.
+            // If ss ran and failed, cmd_name is ss. If ss failed to run, netstat was tried.
+            let cmd_name = if output_result.is_ok() && !output_result.as_ref().unwrap().status.success() {
+                 "ss" // ss ran but had an error status
+            } else if output_result.is_err() {
+                "netstat" // ss failed to run, so netstat was the fallback
+            } else {
+                 "ss/netstat" // Default or if ss succeeded initially (shouldn't reach here if ss succeeded)
+            };
             return Err(PortWatcherError::Command(
-                "ss/netstat".to_string(),
+                cmd_name.to_string(),
                 stderr.to_string(),
             ));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&final_output.stdout);
 
         for cap in LINUX_SS_REGEX.captures_iter(&stdout) {
             if let (Some(port_match), Some(pid_match)) = (cap.get(1), cap.get(2)) {
@@ -290,38 +260,45 @@ fn get_all_listening_tcp_ports(s: &System) -> Result<HashMap<u16, PortInfo>, Por
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        for line in stdout.lines().skip(1) {
-            // Skip header
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 9 {
-                let pid_str = parts[1];
-                let name_part = parts[8]; // e.g., *:5000 or 127.0.0.1:8080 or [::1]:12345
+        // Example lsof output lines:
+        // COMMAND    PID  USER   FD TYPE DEVICE SIZE/OFF NODE NAME
+        // ControlCe  332 myuser  22u IPv4  0x...   0t0  TCP *:5000 (LISTEN)
+        // SystemUIS  333 myuser  17u IPv6  0x...   0t0  TCP [::1]:12345 (LISTEN)
+        // rapportd   759 myuser  11u IPv4  0x...   0t0  TCP 127.0.0.1:60140 (LISTEN)
+        // SomeProces 101 myuser  20u IPv4  0x...   0t0  TCP localhost:http (LISTEN) <- -P should prevent 'http'
+        // SomeProces 102 myuser  20u IPv4  0x...   0t0  TCP 127.0.0.1:8080 (LISTEN)
 
-                if let Ok(pid_val) = pid_str.parse::<u32>() {
-                    let port_str = name_part.split(':').last().unwrap_or("");
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        let process_name = s
-                            .process(Pid::from_u32(pid_val))
-                            .map(|p| p.name().to_string_lossy().into_owned())
-                            .unwrap_or_else(|| parts[0].to_string()); // Fallback to lsof command name
+        for line in stdout.lines().skip(1) { // Skip header line
+            if let Some(cap) = MACOS_LSOF_REGEX.captures(line) {
+                let command_name_from_lsof = cap.name("command").map_or_else(|| "N/A".to_string(), |m| m.as_str().to_string());
+                let pid_str = cap.name("pid").map_or("", |m| m.as_str());
+                let port_str = cap.name("port").map_or("", |m| m.as_str());
 
-                        listening_ports.insert(
+                if let (Ok(pid_val), Ok(port)) = (pid_str.parse::<u32>(), port_str.parse::<u16>()) {
+                    // Successfully parsed PID and Port
+                    let process_name = s
+                        .process(Pid::from_u32(pid_val))
+                        .map(|p| p.name().to_string_lossy().into_owned())
+                        .unwrap_or(command_name_from_lsof); // Fallback to lsof command name captured by regex
+
+                    listening_ports.insert(
+                        port,
+                        PortInfo {
                             port,
-                            PortInfo {
-                                port,
-                                protocol: "TCP".to_string(),
-                                pid: Some(pid_val),
-                                process_name: Some(process_name),
-                                status: "Listening".to_string(),
-                            },
-                        );
-                    }
+                            protocol: "TCP".to_string(),
+                            pid: Some(pid_val),
+                            process_name: Some(process_name),
+                            status: "Listening".to_string(),
+                        },
+                    );
                 }
             }
         }
     }
     #[cfg(target_os = "windows")]
     {
+        // Ensure we import Stdio for Windows command execution
+        use std::process::Stdio;
         let output = Command::new("netstat")
             .args(["-ano", "-p", "TCP"])
             .stdout(Stdio::piped()) // Important for non-UTF8 output
@@ -374,21 +351,41 @@ fn get_all_listening_tcp_ports(s: &System) -> Result<HashMap<u16, PortInfo>, Por
     Ok(listening_ports)
 }
 
-fn kill_process_by_pid(pid_val: u32, s: &System) -> Result<(), PortWatcherError> {
+fn kill_process_by_pid(pid_val: u32, s: &mut System) -> Result<(), PortWatcherError> {
+    // First, try to get the process.
     if let Some(process) = s.process(Pid::from_u32(pid_val)) {
         if process.kill() {
-            Ok(())
+            // If kill() returns true, assume success.
+            // SIGKILL is generally effective immediately. Further checks could be added if necessary.
+            return Ok(());
         } else {
-            // On Unix, kill can fail due to permissions. sysinfo might not give detailed error.
-            // On Windows, taskkill might be more robust if sysinfo::kill fails for permissions.
-            // For now, we rely on sysinfo. If it returns false, it might be permissions.
-            Err(PortWatcherError::KillFailed(
-                pid_val,
-                "Failed to send kill signal. Insufficient permissions or process already exited."
-                    .to_string(),
-            ))
+            // process.kill() returned false. Let's find out why.
+            // Refresh the specific process's state.
+            // `ProcessesToUpdate::Some` expects a slice of PIDs.
+            // `ProcessRefreshKind::everything()` ensures its existence status is up-to-date.
+            // The `true` argument for `clear_state` in refresh_processes_specifics is crucial
+            // if we want to ensure we are not looking at cached state for the process existence.
+            // However, sysinfo's `refresh_processes_specifics` takes `ProcessesToUpdate`, `clear_state: bool`, `refresh_kind: ProcessRefreshKind`
+            // The method signature is pub fn refresh_processes_specifics(&mut self, pids_to_update: ProcessesToUpdate<'_>, clear_state: bool, kind: ProcessRefreshKind) -> usize
+            // Let's ensure we use it correctly. `clear_state` should probably be true.
+            s.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid_val)]), true, ProcessRefreshKind::everything());
+
+
+            // Check if the process still exists after the refresh.
+            if s.process(Pid::from_u32(pid_val)).is_some() {
+                // Process still exists, so kill probably failed due to permissions.
+                Err(PortWatcherError::PermissionDenied)
+            } else {
+                // Process no longer exists, so it likely exited before or during the kill attempt,
+                // or was unkillable by this user but terminated for other reasons after the attempt.
+                Err(PortWatcherError::KillFailed(
+                    pid_val,
+                    "Failed to kill process. It may have already exited or was not killable by the current user and then terminated.".to_string(),
+                ))
+            }
         }
     } else {
+        // Process was not found in the first place.
         Err(PortWatcherError::ProcessNotFound(pid_val))
     }
 }
@@ -429,72 +426,11 @@ fn print_human_readable(infos: &[PortInfo], show_free: bool) {
 // Basic Tests
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*; // This will bring LINUX_SS_REGEX, WINDOWS_NETSTAT_REGEX etc. into scope
 
-    #[test]
-    fn test_parse_ports_single() {
-        let ports = parse_ports_spec("80").unwrap();
-        assert!(ports.contains(&80));
-        assert_eq!(ports.len(), 1);
-    }
+    // Tests for parse_ports_spec have been moved to src/lib.rs
+    // Keep platform-specific regex tests here as they are related to binary's direct dependencies.
 
-    #[test]
-    fn test_parse_ports_list() {
-        let ports = parse_ports_spec("80,443,8080").unwrap();
-        assert!(ports.contains(&80));
-        assert!(ports.contains(&443));
-        assert!(ports.contains(&8080));
-        assert_eq!(ports.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_ports_range() {
-        let ports = parse_ports_spec("8000-8002").unwrap();
-        assert!(ports.contains(&8000));
-        assert!(ports.contains(&8001));
-        assert!(ports.contains(&8002));
-        assert_eq!(ports.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_ports_mixed() {
-        let ports = parse_ports_spec("80,443,8000-8001,3000").unwrap();
-        assert!(ports.contains(&80));
-        assert!(ports.contains(&443));
-        assert!(ports.contains(&8000));
-        assert!(ports.contains(&8001));
-        assert!(ports.contains(&3000));
-        assert_eq!(ports.len(), 5);
-    }
-
-    #[test]
-    fn test_parse_ports_duplicates() {
-        let ports = parse_ports_spec("80,80,8000-8000").unwrap();
-        assert!(ports.contains(&80));
-        assert!(ports.contains(&8000));
-        assert_eq!(ports.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_ports_invalid_range() {
-        assert!(parse_ports_spec("8002-8000").is_err());
-    }
-
-    #[test]
-    fn test_parse_ports_invalid_char() {
-        assert!(parse_ports_spec("80a").is_err());
-        assert!(parse_ports_spec("80-82b").is_err());
-    }
-
-    #[test]
-    fn test_parse_port_zero() {
-        assert!(parse_ports_spec("0").is_err());
-        assert!(parse_ports_spec("0-10").is_err());
-        assert!(parse_ports_spec("10-0").is_err());
-    }
-
-    // Platform-specific regex tests can be tricky without actual command output.
-    // These are basic sanity checks for the regex patterns.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_ss_regex() {
@@ -536,6 +472,34 @@ mod tests {
 
     // macOS lsof output is a bit more complex, so the current regex is simpler.
     // A more robust test would mock `lsof` output structure.
-    // The current macOS lsof parsing in `get_all_listening_tcp_ports` is line-by-line split, not regex based.
-    // The MACOS_LSOF_REGEX is not currently used for the primary parsing logic due to complexity.
+    // The MACOS_LSOF_REGEX is now used for parsing.
+    // A test for MACOS_LSOF_REGEX could be added here if desired, similar to Linux and Windows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_lsof_regex() {
+        let sample_output1 = "ControlCe  332 myuser  22u IPv4  0x...   0t0  TCP *:5000 (LISTEN)";
+        let sample_output2 = "SystemUIS  333 myuser  17u IPv6  0x...   0t0  TCP [::1]:12345 (LISTEN)";
+        let sample_output3 = "rapportd   759 myuser  11u IPv4  0x...   0t0  TCP 127.0.0.1:60140 (LISTEN)";
+        let sample_output4 = "nginx     123 root    5u  IPv4  0x...   0t0  TCP *:80 (LISTEN)"; // Typical command
+
+        let cap1 = MACOS_LSOF_REGEX.captures(sample_output1).unwrap();
+        assert_eq!(cap1.name("command").unwrap().as_str(), "ControlCe");
+        assert_eq!(cap1.name("pid").unwrap().as_str(), "332");
+        assert_eq!(cap1.name("port").unwrap().as_str(), "5000");
+
+        let cap2 = MACOS_LSOF_REGEX.captures(sample_output2).unwrap();
+        assert_eq!(cap2.name("command").unwrap().as_str(), "SystemUIS");
+        assert_eq!(cap2.name("pid").unwrap().as_str(), "333");
+        assert_eq!(cap2.name("port").unwrap().as_str(), "12345");
+
+        let cap3 = MACOS_LSOF_REGEX.captures(sample_output3).unwrap();
+        assert_eq!(cap3.name("command").unwrap().as_str(), "rapportd");
+        assert_eq!(cap3.name("pid").unwrap().as_str(), "759");
+        assert_eq!(cap3.name("port").unwrap().as_str(), "60140");
+        
+        let cap4 = MACOS_LSOF_REGEX.captures(sample_output4).unwrap();
+        assert_eq!(cap4.name("command").unwrap().as_str(), "nginx");
+        assert_eq!(cap4.name("pid").unwrap().as_str(), "123");
+        assert_eq!(cap4.name("port").unwrap().as_str(), "80");
+    }
 }

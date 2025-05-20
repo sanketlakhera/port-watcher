@@ -7,7 +7,9 @@ A cross-platform command-line tool to monitor and manage TCP ports. Written in R
 - Check specific ports or ranges of ports
 - List all listening TCP ports
 - Kill processes using specified ports
+  - Enhanced error reporting for process kill operations, distinguishing between permission issues and already-exited processes.
 - Cross-platform support (Linux, macOS, Windows)
+  - Improved reliability of port detection on macOS through more robust `lsof` parsing.
 - JSON output support
 - Human-readable output format
 
@@ -155,6 +157,26 @@ cargo build --release
 - sysinfo: System information gathering
 - serde: Serialization/deserialization
 - regex: Regular expression support
+
+## Testing
+
+### Unit Tests
+The project includes unit tests for core functionality, such as port string parsing and platform-specific regular expressions. These can be run with `cargo test`.
+
+### Fuzz Testing
+Fuzz testing has been set up for the `parse_ports_spec` function, which is responsible for parsing the port string argument (e.g., "80,8080-8090"). This helps in discovering edge cases and potential panics in the port parsing logic.
+
+**Setup:**
+- The project uses `cargo-fuzz` for fuzz testing.
+- To facilitate this, the `parse_ports_spec` function and related error types have been refactored into a library component of the crate.
+- The fuzz target is defined in `fuzz/fuzz_targets/parse_ports_fuzzer.rs`.
+
+**Current Status:**
+As of the last update, building and running the fuzz tests using `cargo fuzz build` and `cargo fuzz run` is **blocked** in the provided development environment. This is due to an incompatibility: `cargo-fuzz` (v0.12.0, installed via `cargo install cargo-fuzz --locked`) attempts to use Rust compiler flags (specifically `-Zsanitizer=address`) that require a nightly Rust toolchain. The current environment is based on stable Rust (1.75.0), which does not support these flags.
+
+Attempts to configure `cargo-fuzz` to operate without these specific nightly-dependent flags (e.g., by setting `sanitizer = "none"` in `fuzz/Cargo.toml` or `fuzz/.cargo/config.toml`, or by overriding `RUSTFLAGS`) were unsuccessful in preventing the tool from invoking `rustc` with the problematic flags.
+
+The fuzzing infrastructure (code refactoring, fuzz target harness, `cargo-fuzz` dependency) is in place. Fuzzing can be performed if the environment is updated to a nightly Rust toolchain or if a version/configuration of `cargo-fuzz` that is fully compatible with Rust 1.75.0 stable for coverage-only fuzzing becomes available.
 
 ## License
 

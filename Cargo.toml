@@ -1,7 +1,7 @@
 [package]
 name = "port-watcher"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
@@ -11,3 +11,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sysinfo = "0.35.1"
 thiserror = "2.0.12"
+
+[dev-dependencies]
+cargo-fuzz = "0.11.0" # Check for the latest version if possible
+# libfuzzer-sys is usually a dependency of cargo-fuzz itself or brought in by the fuzz target.
+# However, it's good practice to specify it if your fuzz target directly uses it.
+# For `fuzz_target!`, cargo-fuzz handles this.

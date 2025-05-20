@@ -1,0 +1,6 @@
+# Fuzzer-specific configurations for cargo-fuzz
+# This attempts to disable ASan for the parse_ports_fuzzer target
+# to allow building with stable Rust if ASan requires nightly.
+
+[fuzz.fuzzers.parse_ports_fuzzer]
+sanitizer = "none"

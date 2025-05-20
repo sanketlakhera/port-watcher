@@ -1,0 +1,21 @@
+[package]
+name = "port-watcher-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.port-watcher]
+path = ".."
+
+[[bin]]
+name = "parse_ports_fuzzer"
+path = "fuzz_targets/parse_ports_fuzzer.rs"
+test = false
+doc = false
+bench = false
